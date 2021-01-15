@@ -5,9 +5,7 @@ import numpy as np
 from scipy.integrate import solve_ivp
 import xarray
 import pandas as pd
-from collections import OrderedDict
-import copy
-from .utils import read_coordinates_nis
+
 
 class BaseModel:
     """
@@ -40,24 +38,23 @@ class BaseModel:
     coordinates = None
 
     def __init__(self, states, parameters, time_dependent_parameters=None,
-                 discrete=False, spatial=None):
+                 discrete=False):
         self.parameters = parameters
         self.initial_states = states
         self.time_dependent_parameters = time_dependent_parameters
         self.discrete = discrete
-        self.spatial = spatial
 
         if self.stratification:
-            self.stratification_size = []
+            self.stratification_size=[]
             for axis in self.stratification:
                 if not axis in parameters:
                     raise ValueError(
                         "stratification parameter '{0}' is missing from the specified "
-                        "parameters dictionary".format(axis)
+                        "parameters dictionary".format(self.stratification)
                     )
                 self.stratification_size.append(parameters[axis].shape[0])
         else:
-            self.stratification_size = [1]
+            self.stratification_size = 1
 
         if time_dependent_parameters:
             self._validate_time_dependent_parameters()
@@ -81,23 +78,20 @@ class BaseModel:
             )
         if keywords[1] != "param":
             raise ValueError(
-                "The first parameter of the parameter function should be 'param'"
+                "The second parameter of the parameter function should be named 'param'"
             )
-        else:
-            return keywords[2:]
+        # return additional keywords of the function
+        return keywords[2:]
 
     def _validate_time_dependent_parameters(self):
         # Validate arguments of compliance definition
+
         extra_params = []
 
-        all_param_names = self.parameter_names.copy()
-
-        for lst in self.parameters_stratified_names:
-            all_param_names.extend(lst)
-
+        all_param_names = self.parameter_names + self.parameters_stratified_names
         if self.stratification:
             all_param_names.extend(self.stratification)
-
+        
         for param, func in self.time_dependent_parameters.items():
             if param not in all_param_names:
                 raise ValueError(
@@ -159,12 +153,9 @@ class BaseModel:
 
         # additional parameters from time-dependent parameter functions
         # are added to specified_params after the above check
-
+        # TODO check that it doesn't duplicate any existing parameter
         if self._function_parameters:
             extra_params = [item for sublist in self._function_parameters for item in sublist]
-            # TODO check that it doesn't duplicate any existing parameter
-            # Line below removes duplicate arguments
-            extra_params = OrderedDict((x, True) for x in extra_params).keys()
             specified_params += extra_params
             self._n_function_params = len(extra_params)
         else:
@@ -245,25 +236,12 @@ class BaseModel:
         # sort the initial states to match the state_names
         self.initial_states = {state: self.initial_states[state] for state in self.state_names}
 
-        spatial_options = {'mun', 'arr', 'prov'}
-        if self.spatial:
-            # verify wether the spatial parameter value is OK
-            if self.spatial not in spatial_options:
-                raise ValueError(
-                    f"'spatial={self.spatial}' is not a valid choice. Choose from '{spatial_options}'"
-                )
-        # if coordinates contain 'place', the coordinates are taken from read_coordinates_nis, which needs a spatial argument
-        elif self.coordinates and ('place' in self.coordinates):
-            raise ValueError(
-                f"'spatial' argument in model initialisation cannot be None. Choose from '{spatial_options}' in order to load NIS coordinates into the xarray output"
-            )
-
     @staticmethod
     def integrate():
         """to overwrite in subclasses"""
         raise NotImplementedError
 
-    def _create_fun(self, actual_start_date):
+    def _create_fun(self):
         """Convert integrate statement to scipy-compatible function"""
 
         def func(t, y, pars={}):
@@ -273,13 +251,9 @@ class BaseModel:
             params = pars.copy()
 
             if self.time_dependent_parameters:
-                if actual_start_date is not None:
-                    date = self.int_to_date(actual_start_date, t)
-                else:
-                    date = t
-                for i, (param, param_func) in enumerate(self.time_dependent_parameters.items()):
+                for i, (param, func) in enumerate(self.time_dependent_parameters.items()):
                     func_params = {key: params[key] for key in self._function_parameters[i]}
-                    params[param] = param_func(date, pars[param], **func_params)
+                    params[param] = func(t, pars[param], **func_params)
 
             if self._n_function_params > 0:
                 model_pars = list(params.values())[:-self._n_function_params]
@@ -291,34 +265,29 @@ class BaseModel:
             for size in self.stratification_size:
                 size_lst.append(size)
             y_reshaped = y.reshape(tuple(size_lst))
+
             dstates = self.integrate(t, *y_reshaped, *model_pars)
             return np.array(dstates).flatten()
 
         return func
 
-    def _sim_single(self, time, actual_start_date=None):
+    def _sim_single(self, time):
         """"""
-        fun = self._create_fun(actual_start_date)
+        fun = self._create_fun()
 
         t0, t1 = time
         t_eval = np.arange(start=t0, stop=t1 + 1, step=1)
-        
-        # Initial conditions must be one long list of values
-        if self.spatial:
-            y0 = list(itertools.chain(*list(itertools.chain(*self.initial_states.values()))))
-        else:
-            y0 = list(itertools.chain(*self.initial_states.values()))
 
         if self.discrete == False:
             output = solve_ivp(fun, time,
-                           y0,
+                           list(itertools.chain(*self.initial_states.values())),
                            args=[self.parameters], t_eval=t_eval)
         else:
             output = self.solve_discrete(fun,time,list(itertools.chain(*self.initial_states.values())),
                             args=self.parameters)
 
         # map to variable names
-        return self._output_to_xarray_dataset(output, actual_start_date)
+        return self._output_to_xarray_dataset(output)
 
     def solve_discrete(self,fun,time,y,args):
         # Preparations
@@ -342,51 +311,27 @@ class BaseModel:
         }
         return output
 
-    def date_to_diff(self, actual_start_date, end_date):
+    def date_to_diff(self, start_date, date, excess_time):
         """
         Convert date string to int (i.e. number of days since day 0 of simulation,
-        which is warmup days before actual_start_date)
+        which is excess_time days before start_date)
         """
-        return int((pd.to_datetime(end_date)-pd.to_datetime(actual_start_date))/pd.to_timedelta('1D'))
+        return int((pd.to_datetime(date)-pd.to_datetime(start_date))/pd.to_timedelta('1D'))+excess_time
 
-    def int_to_date(self, actual_start_date, t):
-        date = actual_start_date + pd.Timedelta(t, unit='D')
-        return date
-
-    def sim(self, time, warmup=0, start_date=None, N=1, draw_fcn=None, samples=None, to_sample=['beta','l','tau','prevention'], verbose=False):
-
+    def sim(self, time, excess_time=None, checkpoints=None, start_date='2020-03-15'):
         """
-        Run a model simulation for the given time period. Can optionally perform N repeated simulations of time days.
-        Can use samples drawn using MCMC to perform the repeated simulations.
-
+        Run a model simulation for the given time period.
 
         Parameters
         ----------
-        time : int, list of int [start, stop], string or timestamp
+        time : int or list of int [start, stop]
             The start and stop time for the simulation run.
             If an int is specified, it is interpreted as [0, time].
-            If a string or timestamp is specified, this is interpreted as the end time of the simulation
-
-        warmup : int
-            Number of days for model warm-up
-
-        start_date : str or timestamp
-            Model starts to run on start_date - warmup
-
-        N : int
-            Number of repeated simulations (useful for stochastic models). One by default.
-
-        draw_fcn : function
-            A function which takes as its input the dictionary of model parameters 
-            and the dictionary of sampled parameter values and assings these samples to the model parameter dictionary ad random.
-            # TO DO: verify draw_fcn
-
-        samples : dictionary
-            Sample dictionary used by draw_fcn.
-            # TO DO: should not be included if draw_fcn is not None. How can this be made more elegant?
-
-        to_sample : list
-            list of parameters to sample by draw_fcn, default ['beta','l','tau','prevention']
+        checkpoints : dict
+            A dictionary with a "time" key and additional parameter keys,
+            in the form of
+            ``{"time": [t1, t2, ..], "param": [param1, param2, ..], ..}``
+            indicating new parameter values at the corresponding timestamps.
 
         Returns
         -------
@@ -394,51 +339,81 @@ class BaseModel:
 
         """
 
-
-        if start_date is not None:
-            actual_start_date = pd.Timestamp(start_date) - pd.Timedelta(warmup, unit='D')
-        else:
-            actual_start_date = None
-
         if isinstance(time, int):
             time = [0, time]
 
-        elif isinstance(time, list):
-            time = time
+        if isinstance(time, str):
+            time = [0, self.date_to_diff(start_date, time, excess_time)]
 
-        elif isinstance(time, (str, pd.Timestamp)):
-            if not isinstance(start_date, (str, pd.Timestamp)):
-                raise TypeError(
-                    'start_date needs to be string or timestamp, not None'
+        if checkpoints:
+            for i in range(len(checkpoints["time"])):
+                if isinstance(checkpoints["time"][i],str):
+                    checkpoints["time"][i] = self.date_to_diff(start_date, checkpoints["time"][i], excess_time)
+
+        original_parameters = self.parameters.copy()
+        original_initial_states = self.initial_states.copy()
+        self.time_of_lst_chk= 0
+
+        if checkpoints is None:
+            return self._sim_single(
+                time
                 )
-            time = [0, self.date_to_diff(actual_start_date, time)]
 
-        else:
-            raise TypeError(
-                    'time must be int, list of ints [start, stop], string or timestamp'
+        # checkpoints dictionary has the form of
+        #   {"time": [t1, t2], "param": [param1, param2]}
+
+        time_points = [time[0], *checkpoints["time"], time[1]]
+        results = []
+
+        # first part of the simulation with original parameters
+        output = self._sim_single(
+            [time_points[0], time_points[1]]
+        )
+        results.append(output)
+        try:
+            # further simulations with updated parameters
+            for i in range(0, len(checkpoints["time"])):
+                # update parameters
+                for param in checkpoints.keys():
+                    if param != 'time' and param != self.apply_compliance_to:
+                        self.parameters[param] = checkpoints[param][i]
+                    elif param != 'time' and param == self.apply_compliance_to:
+                        # assign old and new Nc to class
+                        self.old = self.parameters[param]
+                        self.new = checkpoints[param][i]
+                self._validate()
+
+                # update initial states with states of last result
+                previous_output = results[-1]
+                last_states = previous_output.isel(time=-1)
+                initial_states = {}
+                for state in self.state_names:
+                    initial_states[state] = last_states[state].values
+                self.initial_states = initial_states
+
+                # continue simulation
+                self.time_of_lst_chk = time_points[i + 1]
+
+                output = self._sim_single(
+                    [time_points[i + 1], time_points[i + 2] ]
                 )
-        # Copy parameter dictionary --> dict is global
-        cp = copy.deepcopy(self.parameters)
-        # Perform first simulation as preallocation
-        if verbose==True:
-            print(f"Simulating draw 1/{N}", end='\x1b[1K\r') # end statement overwrites entire line
-        if draw_fcn:
-            self.parameters = draw_fcn(self.parameters,samples,to_sample)
-        out = self._sim_single(time, actual_start_date)
-        # Repeat N - 1 times and concatenate
-        for n in range(N-1):
-            if verbose==True:
-                print(f"Simulating draw {n+2}/{N}", end='\x1b[1K\r')
-            if draw_fcn:
-                self.parameters = draw_fcn(self.parameters,samples,to_sample)
-            out = xarray.concat([out, self._sim_single(time, actual_start_date)], "draws")
 
-        # Reset parameter dictionary
-        self.parameters = cp
+                results.append(output.loc[dict(time=slice(time_points[i + 1]+1,time_points[i + 2]))])
+                #results.append(output)
+        except:
+            # reset parameters and initial states to original value
+            self.parameters = original_parameters
+            self.initial_states = original_initial_states
+            raise
 
-        return out
+        # reset parameters and initial states to original value
+        self.parameters = original_parameters
+        self.initial_states = original_initial_states
 
-    def _output_to_xarray_dataset(self, output, actual_start_date=None):
+        # return combined output
+        return xarray.concat(results, dim="time")
+
+    def _output_to_xarray_dataset(self, output):
         """
         Convert array (returned by scipy) to an xarray Dataset with variable names
         """
@@ -449,24 +424,17 @@ class BaseModel:
             dims = []
         dims.append('time')
 
-        if actual_start_date is not None:
-            time = actual_start_date + pd.to_timedelta(output["t"], unit='D')
-        else:
-            time = output["t"]
-
         coords = {
-            "time": time,
+            "time": output["t"],
         }
 
         if self.stratification:
             for i in range(len(self.stratification)):
-                if self.coordinates:
-                    if (self.coordinates[i] == 'place') and self.spatial:
-                        coords.update({self.stratification[i] : read_coordinates_nis(spatial=self.spatial)})
-                    elif self.coordinates[i] is not None:
-                        coords.update({self.stratification[i]: self.coordinates[i]})
+                if self.coordinates and self.coordinates[i] is not None:
+                    coords.update({self.stratification[i]: self.coordinates[i]})
                 else:
                     coords.update({self.stratification[i]: np.arange(self.stratification_size[i])})
+
 
         size_lst = [len(self.state_names)]
         if self.stratification:
